@@ -1,19 +1,28 @@
 import time
 import cv2
+import onnxruntime as ort
 import numpy as np
+
 try:
     import RPi.GPIO as GPIO
+
     HAS_PI = True
 except:
     HAS_PI = False
 import pyaudio
-import audioop
+import struct
+import math
 
 ############################
 # 配置区域
 ############################
 
 VIDEO_DEVICE = "/dev/video0"
+
+# YOLO
+MODEL_PATH = "yolov8n.onnx"
+CONF_THRES = 0.26
+DETECT_CLASS = 14
 
 # HC-SR04 GPIO
 TRIG_PIN = 23
@@ -23,8 +32,8 @@ ECHO_PIN = 24
 STEPPER_PINS = [17, 18, 27, 22]
 
 # 音频参数
-AUDIO_DEVICE_INDEX = 1     # 用 arecord -l 查看
-AUDIO_THRESHOLD = 500      # 声音能量阈值（可调）
+AUDIO_DEVICE_INDEX = 1  # 用 arecord -l 查看
+AUDIO_THRESHOLD = 500  # 声音能量阈值（可调）
 
 DISTANCE_THRESHOLD_CM = 10
 SLEEP_AFTER_FEED = 60
@@ -46,14 +55,14 @@ if HAS_PI:
 ############################
 
 HALF_STEP_SEQ = [
-    [1,0,0,0],
-    [1,1,0,0],
-    [0,1,0,0],
-    [0,1,1,0],
-    [0,0,1,0],
-    [0,0,1,1],
-    [0,0,0,1],
-    [1,0,0,1],
+    [1, 0, 0, 0],
+    [1, 1, 0, 0],
+    [0, 1, 0, 0],
+    [0, 1, 1, 0],
+    [0, 0, 1, 0],
+    [0, 0, 1, 1],
+    [0, 0, 0, 1],
+    [1, 0, 0, 1],
 ]
 
 STEPS_PER_REV = 4096
@@ -63,13 +72,103 @@ STEPS_180 = STEPS_PER_REV // 2
 # 功能函数
 ############################
 
-def detect_cat(frame):
-    """
-    Placeholder：这里替换成你自己的 YOLO 推理
-    返回 True / False
-    """
-    # TODO: 接你的 YOLO 代码
-    return True   # 暂时假设检测到猫
+mod_yolo = None
+dev_cap = None
+
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
+def detect_cat():
+    global dev_cap, mod_yolo
+
+    def nms_xyxy(boxes, scores, iou_thres=0.5):
+        def iou_xyxy(box, boxes):
+            """
+            box:  (4,)   [x1,y1,x2,y2]
+            boxes:(N,4)
+            """
+            x1 = np.maximum(box[0], boxes[:, 0])
+            y1 = np.maximum(box[1], boxes[:, 1])
+            x2 = np.minimum(box[2], boxes[:, 2])
+            y2 = np.minimum(box[3], boxes[:, 3])
+
+            inter = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+            area1 = (box[2] - box[0]) * (box[3] - box[1])
+            area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+            return inter / (area1 + area2 - inter + 1e-6)
+
+        order = scores.argsort()[::-1]
+        keep = []
+
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+
+            if order.size == 1:
+                break
+
+            ious = iou_xyxy(boxes[i], boxes[order[1:]])
+            order = order[1:][ious < iou_thres]
+
+        return keep
+
+    if dev_cap is None:
+        dev_cap = cv2.VideoCapture(VIDEO_DEVICE)
+        if not dev_cap.isOpened():
+            raise RuntimeError("Camera open failed")
+
+        dev_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        dev_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        dev_cap.set(cv2.CAP_PROP_FPS, 12)
+
+        mod_yolo = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+
+    ret, frame = dev_cap.read()
+    if not ret:
+        return False
+    img = cv2.resize(frame, (640, 640))
+
+    blob = img.astype(np.float32) / 255.0
+    blob = np.transpose(blob, (2, 0, 1))[None]
+
+    pred = mod_yolo.run(None, {"images": blob})[0][0]
+
+    boxes = pred[:4, :]
+    scores = sigmoid(pred[4, :])
+    classes = sigmoid(pred[5:, :])
+
+    cls_ids = np.argmax(classes, axis=0)
+    cls_scores = classes[cls_ids, range(classes.shape[1])]
+    final_scores = scores * cls_scores
+
+    mask = (cls_ids == DETECT_CLASS) & (final_scores > CONF_THRES)
+    cx, cy, w, h = boxes[:, mask]
+    if len(cx) == 0:
+        return False
+
+    # --- xywh -> xyxy ---
+    x1 = (cx - w / 2) * frame.shape[1] / 640
+    y1 = (cy - h / 2) * frame.shape[0] / 640
+    x2 = (cx + w / 2) * frame.shape[1] / 640
+    y2 = (cy + h / 2) * frame.shape[0] / 640
+
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    scores_nms = final_scores[mask]
+
+    # --- NMS ---
+    keep = nms_xyxy(boxes_xyxy, scores_nms, iou_thres=0.5)
+
+    # --- output ---
+    for i in keep:
+        xi1, yi1, xi2, yi2 = boxes_xyxy[i]
+        print(
+            f"[cat] {scores_nms[i]:.2f} | ({int(xi1)},{int(yi1)},{int(xi2)},{int(yi2)})"
+        )
+
+    return True
 
 
 def get_distance_cm():
@@ -95,22 +194,32 @@ def get_distance_cm():
     return distance
 
 
+dev_audio = None
+audio_steam = None
+
+
 def detect_sound():
-    p = pyaudio.PyAudio()
+    global dev_audio, audio_steam
+    return False
+    if dev_audio is None:
+        dev_audio = pyaudio.PyAudio()
+        audio_steam = dev_audio.open(
+            format=pyaudio.paInt16,
+            channels=0,
+            rate=16000,
+            input=True,
+            input_device_index=AUDIO_DEVICE_INDEX,
+            frames_per_buffer=1024,
+        )
 
-    stream = p.open(format=pyaudio.paInt16,
-                    channels=1,
-                    rate=16000,
-                    input=True,
-                    input_device_index=AUDIO_DEVICE_INDEX,
-                    frames_per_buffer=1024)
+    audio_steam.start_stream()
+    data = audio_steam.read(1024, exception_on_overflow=False)
 
-    data = stream.read(1024, exception_on_overflow=False)
-    rms = audioop.rms(data, 2)
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+    count = len(data) // 2
+    samples = struct.unpack(f"{count}h", data)
+    # 2. 计算 RMS (均方根) 公式：sqrt( sum(x^2) / n )
+    sum_squares = sum(sample**2 for sample in samples)
+    rms = math.sqrt(sum_squares / count)
 
     print(f"[Audio] RMS = {rms}")
     return rms > AUDIO_THRESHOLD
@@ -134,38 +243,41 @@ def feed():
     step_motor(STEPS_180, reverse=True)
     print("[Motor] Done")
 
+
 ############################
 # 主循环
 ############################
 
+
 def main():
-    cap = cv2.VideoCapture(VIDEO_DEVICE)
-
-    if not cap.isOpened():
-        print("Camera open failed")
-        return
-
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                continue
+            cat_in_sight = detect_cat()
+            cat_meowing = detect_sound()
+            cat_distance = get_distance_cm()
 
-            if detect_cat(frame):
-                distance = get_distance_cm()
-                print(f"[Distance] {distance:.2f} cm")
+            print(f"{cat_in_sight=}, {cat_meowing=}, {cat_distance=}")
+            # if detect_cat(frame):
+            #     distance = get_distance_cm()
+            #     print(f"[Distance] {distance:.2f} cm")
 
-                if distance < DISTANCE_THRESHOLD_CM:
-                    if detect_sound():
-                        feed()
-                        print("[System] Sleeping...")
-                        time.sleep(SLEEP_AFTER_FEED)
+            #     if distance < DISTANCE_THRESHOLD_CM:
+            #         if detect_sound():
+            #             feed()
+            #             print("[System] Sleeping...")
+            #             time.sleep(SLEEP_AFTER_FEED)
+
             time.sleep(0.1)
 
     finally:
-        cap.release()
         if HAS_PI:
             GPIO.cleanup()
+        try:
+            dev_cap.release()
+            dev_audio.close()
+        except:
+            pass
+
 
 if __name__ == "__main__":
     main()
