@@ -2,6 +2,9 @@ import time
 import cv2
 import onnxruntime as ort
 import numpy as np
+import sounddevice as sd
+import struct
+import math
 
 try:
     import RPi.GPIO as GPIO
@@ -9,19 +12,16 @@ try:
     HAS_PI = True
 except:
     HAS_PI = False
-import pyaudio
-import struct
-import math
 
 ############################
 # 配置区域
 ############################
 
-VIDEO_DEVICE = "/dev/video0"
+VIDEO_DEVICE = 0
 
 # YOLO
 MODEL_PATH = "yolov8n.onnx"
-CONF_THRES = 0.26
+CONF_THRES = 0.3
 DETECT_CLASS = 14
 
 # HC-SR04 GPIO
@@ -72,8 +72,14 @@ STEPS_180 = STEPS_PER_REV // 2
 # 功能函数
 ############################
 
-mod_yolo = None
-dev_cap = None
+mod_yolo = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+dev_cap = cv2.VideoCapture(VIDEO_DEVICE)
+if not dev_cap.isOpened():
+    raise RuntimeError("Camera open failed")
+
+dev_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+dev_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+dev_cap.set(cv2.CAP_PROP_FPS, 12)
 
 
 def sigmoid(x):
@@ -114,17 +120,6 @@ def detect_cat():
             order = order[1:][ious < iou_thres]
 
         return keep
-
-    if dev_cap is None:
-        dev_cap = cv2.VideoCapture(VIDEO_DEVICE)
-        if not dev_cap.isOpened():
-            raise RuntimeError("Camera open failed")
-
-        dev_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        dev_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        dev_cap.set(cv2.CAP_PROP_FPS, 12)
-
-        mod_yolo = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
 
     ret, frame = dev_cap.read()
     if not ret:
@@ -194,34 +189,39 @@ def get_distance_cm():
     return distance
 
 
-dev_audio = None
-audio_steam = None
+# 配置参数（需根据实际情况调整）
+AUDIO_DEVICE_INDEX = None  # 音频输入设备索引，None 表示使用默认设备
+AUDIO_THRESHOLD = 500  # 声音检测阈值
+
+# 全局音频流对象
+audio_stream = None
 
 
 def detect_sound():
-    global dev_audio, audio_steam
-    return False
-    if dev_audio is None:
-        dev_audio = pyaudio.PyAudio()
-        audio_steam = dev_audio.open(
-            format=pyaudio.paInt16,
-            channels=0,
-            rate=16000,
-            input=True,
-            input_device_index=AUDIO_DEVICE_INDEX,
-            frames_per_buffer=1024,
+    global audio_stream
+
+    # 初始化音频流（直接传参，省略字典封装）
+    if audio_stream is None:
+        audio_stream = sd.InputStream(
+            samplerate=16000,  # 采样率
+            channels=1,  # 声道数（必须≥1，修正原代码0声道错误）
+            dtype="int16",  # 对应pyaudio的paInt16
+            blocksize=1024,  # 缓冲区大小
+            device=AUDIO_DEVICE_INDEX,  # 输入设备索引
         )
+        audio_stream.start()
 
-    audio_steam.start_stream()
-    data = audio_steam.read(1024, exception_on_overflow=False)
+    # 读取音频数据 + 计算RMS（其余逻辑和之前完全一致）
+    data, overflow = audio_stream.read(1024)
+    if overflow:
+        print("[Audio] 警告：音频缓冲区溢出")
 
-    count = len(data) // 2
-    samples = struct.unpack(f"{count}h", data)
-    # 2. 计算 RMS (均方根) 公式：sqrt( sum(x^2) / n )
-    sum_squares = sum(sample**2 for sample in samples)
+    samples = data.flatten()
+    sum_squares = np.sum(np.square(samples.flatten().astype(np.int32)))
+    count = len(samples) if len(samples) > 0 else 1
+
     rms = math.sqrt(sum_squares / count)
-
-    print(f"[Audio] RMS = {rms}")
+    print(f"[Audio] RMS = {rms:.2f}")
     return rms > AUDIO_THRESHOLD
 
 
@@ -268,8 +268,10 @@ def main():
             #             time.sleep(SLEEP_AFTER_FEED)
 
             time.sleep(0.1)
-
+    except KeyboardInterrupt:
+        pass
     finally:
+        print("Closing")
         if HAS_PI:
             GPIO.cleanup()
         try:
