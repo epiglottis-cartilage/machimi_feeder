@@ -3,8 +3,10 @@ import cv2
 import onnxruntime as ort
 import numpy as np
 import sounddevice as sd
-import struct
+import queue
+import csv
 import math
+import tflite_runtime.interpreter as tflite
 
 try:
     import RPi.GPIO as GPIO
@@ -144,24 +146,24 @@ def detect_cat():
     if len(cx) == 0:
         return False
 
-    # --- xywh -> xyxy ---
-    x1 = (cx - w / 2) * frame.shape[1] / 640
-    y1 = (cy - h / 2) * frame.shape[0] / 640
-    x2 = (cx + w / 2) * frame.shape[1] / 640
-    y2 = (cy + h / 2) * frame.shape[0] / 640
+    # # --- xywh -> xyxy ---
+    # x1 = (cx - w / 2) * frame.shape[1] / 640
+    # y1 = (cy - h / 2) * frame.shape[0] / 640
+    # x2 = (cx + w / 2) * frame.shape[1] / 640
+    # y2 = (cy + h / 2) * frame.shape[0] / 640
 
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
-    scores_nms = final_scores[mask]
+    # boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    # scores_nms = final_scores[mask]
 
-    # --- NMS ---
-    keep = nms_xyxy(boxes_xyxy, scores_nms, iou_thres=0.5)
+    # # --- NMS ---
+    # keep = nms_xyxy(boxes_xyxy, scores_nms, iou_thres=0.5)
 
-    # --- output ---
-    for i in keep:
-        xi1, yi1, xi2, yi2 = boxes_xyxy[i]
-        print(
-            f"[cat] {scores_nms[i]:.2f} | ({int(xi1)},{int(yi1)},{int(xi2)},{int(yi2)})"
-        )
+    # # --- output ---
+    # for i in keep:
+    #     xi1, yi1, xi2, yi2 = boxes_xyxy[i]
+    #     print(
+    #         f"[cat] {scores_nms[i]:.2f} | ({int(xi1)},{int(yi1)},{int(xi2)},{int(yi2)})"
+    #     )
 
     return True
 
@@ -190,39 +192,91 @@ def get_distance_cm():
 
 
 # 配置参数（需根据实际情况调整）
-AUDIO_DEVICE_INDEX = None  # 音频输入设备索引，None 表示使用默认设备
-AUDIO_THRESHOLD = 500  # 声音检测阈值
+SAMPLE_RATE = 16000
+WINDOW_SIZE = 15600  # 1.0 s
+HOP_SIZE = 8000  # 0.5 s
+THRESHOLD = 0.2
+CONSECUTIVE_HITS = 3  # 连续命中次数
 
-# 全局音频流对象
-audio_stream = None
+MODEL_PATH = "yamnet.tflite"
+CLASS_MAP_PATH = "yamnet_class_map.csv"
+
+# 加载模型
+interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+
+# 加载类别映射
+class_names = []
+with open(CLASS_MAP_PATH) as f:
+    reader = csv.reader(f)
+    next(reader)  # skip header
+    for row in reader:
+        class_names.append(row[2])
+
+cat_indices = [
+    i
+    for i, name in enumerate(class_names)
+    if "cat" in name.lower() or "meow" in name.lower()
+]
+
+print("Cat-related class indices:", cat_indices)
+for i in cat_indices:
+    print(f"  {i}: {class_names[i]}")
+
+# 音频队列
+audio_q = np.zeros(0, dtype=np.float32)
+
+
+def audio_callback(indata, frames, time_info, status):
+    global audio_q
+    if status:
+        print(status)
+    start = max((len(audio_q) - WINDOW_SIZE * 2, 0))
+    audio_q = np.concatenate([audio_q[start:], indata[:, 0].copy()])
+
+
+# 推理函数
+def yamnet_infer(waveform: np.ndarray) -> np.ndarray:
+    """
+    waveform: (N,) float32
+    return: scores (frames, 521)
+    """
+    interpreter.set_tensor(input_details[0]["index"], waveform)
+    interpreter.invoke()
+    scores = interpreter.get_tensor(output_details[0]["index"])
+    return scores
+
+
+dev_sound = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=audio_callback)
+dev_sound.start()
 
 
 def detect_sound():
-    global audio_stream
+    buffer = audio_q
+    hit_count = 0
 
-    # 初始化音频流（直接传参，省略字典封装）
-    if audio_stream is None:
-        audio_stream = sd.InputStream(
-            samplerate=16000,  # 采样率
-            channels=1,  # 声道数（必须≥1，修正原代码0声道错误）
-            dtype="int16",  # 对应pyaudio的paInt16
-            blocksize=1024,  # 缓冲区大小
-            device=AUDIO_DEVICE_INDEX,  # 输入设备索引
-        )
-        audio_stream.start()
+    # 滑窗
+    while len(buffer) >= WINDOW_SIZE:
+        chunk = buffer[:WINDOW_SIZE]
+        buffer = buffer[HOP_SIZE:]
 
-    # 读取音频数据 + 计算RMS（其余逻辑和之前完全一致）
-    data, overflow = audio_stream.read(1024)
-    if overflow:
-        print("[Audio] 警告：音频缓冲区溢出")
+        scores = yamnet_infer(chunk)
+        cat_score = scores[:, cat_indices].max()
 
-    samples = data.flatten()
-    sum_squares = np.sum(np.square(samples.flatten().astype(np.int32)))
-    count = len(samples) if len(samples) > 0 else 1
+        if cat_score > THRESHOLD:
+            hit_count += 2
+        else:
+            hit_count = max(0, hit_count - 1)
 
-    rms = math.sqrt(sum_squares / count)
-    print(f"[Audio] RMS = {rms:.2f}")
-    return rms > AUDIO_THRESHOLD
+        # print(f"cat_score={cat_score:.3f}, hit={hit_count}")
+
+        if hit_count >= CONSECUTIVE_HITS:
+            return True
+    return hit_count
 
 
 def step_motor(steps, delay=0.001, reverse=False):
@@ -257,17 +311,7 @@ def main():
             cat_distance = get_distance_cm()
 
             print(f"{cat_in_sight=}, {cat_meowing=}, {cat_distance=}")
-            # if detect_cat(frame):
-            #     distance = get_distance_cm()
-            #     print(f"[Distance] {distance:.2f} cm")
-
-            #     if distance < DISTANCE_THRESHOLD_CM:
-            #         if detect_sound():
-            #             feed()
-            #             print("[System] Sleeping...")
-            #             time.sleep(SLEEP_AFTER_FEED)
-
-            time.sleep(0.1)
+            time.sleep(0.01)
     except KeyboardInterrupt:
         pass
     finally:
@@ -276,7 +320,7 @@ def main():
             GPIO.cleanup()
         try:
             dev_cap.release()
-            dev_audio.close()
+            dev_sound.close()
         except:
             pass
 
