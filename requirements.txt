@@ -1,0 +1,7 @@
+numpy<2
+opencv-python
+onnxruntime
+ultralytics
+sounddevice
+tflite_runtime
+rpi-gpio
