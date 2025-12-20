@@ -15,7 +15,7 @@ def read_avg(n=3):
 
 def read():
     def fix(x):
-        (x - 535.5) * (235 - 96.83)
+        return (x - 535.5) * (235 - 96.83)
 
     raw = dev.getRawBytes()
     weight = dev.rawBytesToWeight(raw)
