@@ -9,7 +9,7 @@ def init():
     dev.setReferenceUnit(1_000)
 
 
-def read_avg(n):
+def read_avg(n=3):
     return sum((read() for _ in range(n))) / n
 
 
