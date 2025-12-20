@@ -11,4 +11,5 @@ dependencies = [
     "ultralytics",
     "sounddevice",
     "tflite_runtime",
+    "rpi-gpio",
 ]
