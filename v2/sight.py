@@ -3,6 +3,9 @@ import cv2
 from ultralytics.models.yolo import YOLO
 import threading
 
+HUMAN = 0
+CAT = 15
+
 
 latest_frame = None
 frame_lock = threading.Lock()
@@ -37,7 +40,7 @@ def camera_thread(cap):
             latest_frame = frame
 
 
-def can_see():
+def can_see(objs):
     global scan_angle, scan_direction, model
 
     with frame_lock:
@@ -47,7 +50,7 @@ def can_see():
 
     # YOLO 推理（检测猫=15）
     starttime = time.time()
-    results = model(frame, classes=[15], conf=0.5)
+    results = model(frame, classes=objs, conf=0.5)
     result = results[0]
     starttime = time.time() - starttime
     # print(f"eval time: {starttime * 1000:.1f} ms")

@@ -1,5 +1,5 @@
 import uln2003
-from queue import Queue
+import queue
 import threading
 
 killed = False
@@ -7,41 +7,50 @@ killed = False
 
 def _worker():
     global cmds, dev
-    while not killed:
-        step = cmds.get(timeout=1)
-        if step is None:
-            continue
-        dev.rotate(step)
+    while True:
+        try:
+            step = cmds.get(timeout=1)
+            dev.rotate(step)
+        except:
+            pass
+        finally:
+            if killed:
+                break
 
 
 def init():
     global dev, cmds, t
-    cmds = Queue(maxsize=16)
+    cmds = queue.Queue(maxsize=16)
     dev = uln2003.ULN2003([17, 18, 27, 22], step=2)
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
 
-def rotate(steps):
+def rotate(steps, nonblock=True):
     global cmds
-    cmds.put(int(steps))
+    if nonblock:
+        cmds.put(int(steps))
+    else:
+        dev.rotate(steps)
 
 
 def close():
     global dev, killed, cmds, t
-    del dev
     killed = True
     t.join()
+    del dev
     del cmds
 
 
 def main():
     init()
-    print("+")
-    rotate(300)
-    print("-")
-    rotate(-300)
-    print(".")
+    try:
+        while True:
+            n = int(input(">"))
+            rotate(n)
+    except KeyboardInterrupt:
+        pass
+
     close()
 
 
