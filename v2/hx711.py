@@ -427,5 +427,15 @@ class HX711:
 
         return True
 
+    def cleanup(self):
+        GPIO.output(self.PD_SCK, 0)
+        GPIO.cleanup([self.PD_SCK, self.DOUT])
+
+    def __del__(self):
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
 
 # EOF - hx711.py

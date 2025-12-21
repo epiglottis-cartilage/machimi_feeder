@@ -9,6 +9,11 @@ def init():
     dev.setReferenceUnit(1_000)
 
 
+def close():
+    global dev
+    del dev
+
+
 def read_avg(n=3):
     return sum((read() for _ in range(n))) / n
 
