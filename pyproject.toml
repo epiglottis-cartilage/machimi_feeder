@@ -11,5 +11,5 @@ dependencies = [
     "sounddevice",
     "tflite_runtime",
     "rpi-gpio",
-    "pyaudio>=0.2.14",
+    "pyaudio",
 ]
