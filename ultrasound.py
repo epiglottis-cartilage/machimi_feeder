@@ -22,6 +22,10 @@ def read():
     return distance
 
 
+def nearby():
+    return read_avg() < 40.0
+
+
 def main():
     init()
     try:

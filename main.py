@@ -3,6 +3,7 @@ import sight
 import weight
 import motor
 import beep
+import ultrasound
 
 # import hearing
 from sight import HUMAN, CAT
@@ -13,6 +14,7 @@ if __name__ == "__main__":
     # hearing.init()
     weight.init()
     motor.init()
+    ultrasound.init()
     beep.init()
     try:
         while True:
@@ -21,6 +23,10 @@ if __name__ == "__main__":
             if w - 288.5 < 40:
                 beep.beep()
                 time.sleep(3)
+                continue
+
+            if not ultrasound.nearby():
+                time.sleep(1)
                 continue
 
             step = 430 if w < 600 else 400
@@ -39,4 +45,5 @@ if __name__ == "__main__":
     # hearing.close()
     weight.close()
     motor.close()
+    ultrasound.close()
     beep.close()
